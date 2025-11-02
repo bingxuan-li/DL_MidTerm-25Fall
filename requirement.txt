@@ -1,0 +1,7 @@
+xformers
+trl
+peft
+accelerate
+bitsandbytes-windows
+transformers
+torchao=0.13.0
