@@ -6,29 +6,22 @@ import wandb, tqdm
 from datasets import load_dataset
 from unsloth import FastLanguageModel
 from trl import SFTTrainer
-from transformers import TrainingArguments
+from transformers import TrainingArguments, TrainerCallback
 
 # -----------------------------
 # Configuration
 # -----------------------------
 MODEL_NAME = "unsloth/Llama-3-8B-bnb-4bit"
 OUTPUT_DIR = "./math_verifier_model"
-MAX_SEQ_LEN = 2048  # longer sequences to cover full solution
+MAX_SEQ_LEN = 2048
 BATCH_SIZE = 2
 GRAD_ACCUM = 4
 LEARNING_RATE = 2e-4
-EPOCHS = 1  # increase if time/memory allows
+EPOCHS = 1
 
 wandb.init(
     project="math-verifier",
     name="llama3-8b-qlora-optimized",
-    config={
-        "model": MODEL_NAME,
-        "batch_size": BATCH_SIZE,
-        "grad_accum": GRAD_ACCUM,
-        "epochs": EPOCHS,
-        "max_seq_len": MAX_SEQ_LEN,
-    },
 )
 
 # -----------------------------
@@ -37,7 +30,6 @@ wandb.init(
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=MODEL_NAME,
     max_seq_length=MAX_SEQ_LEN,
-    dtype=None,
     load_in_4bit=True
 )
 
@@ -51,127 +43,115 @@ model = FastLanguageModel.get_peft_model(
 )
 
 # -----------------------------
-# Load dataset
+# Dataset split
 # -----------------------------
-dataset = load_dataset("ad6398/nyu-dl-teach-maths-comp", split="train[:100]")
+full_dataset = load_dataset("ad6398/nyu-dl-teach-maths-comp", split="train")
+shuffled_dataset = full_dataset.shuffle(seed=42)
+train_dataset = shuffled_dataset.select(range(100000))
+validation_dataset = shuffled_dataset.select(range(100000, 101000))
 
 # -----------------------------
-# Data cleaning + preprocessing
+# Cleaning
 # -----------------------------
 def clean_solution(example):
-    # Remove code fences
     solution = re.sub(r"```.*?```", "", example['solution'], flags=re.DOTALL)
-    # Normalize numbers to 4 decimal places
     solution = re.sub(r"\d+\.\d+", lambda x: f"{float(x.group()):.4f}", solution)
     example['solution'] = solution
-    # Convert boolean label to string for SFT
     example['is_correct'] = str(example['is_correct'])
     return example
 
-dataset = dataset.map(clean_solution)
+train_dataset = train_dataset.map(clean_solution)
+validation_dataset = validation_dataset.map(clean_solution)
 
 # -----------------------------
 # Prompt formatting
 # -----------------------------
-EOS_TOKEN = tokenizer.eos_token  # usually ''
+EOS = tokenizer.eos_token
 
-training_prompt = """Decide if the given answer is correct. Respond with True or False only. \nQuestion: {}\nProposed Answer: {}\nSolution:{}\nCorrectness:{}"""
+training_prompt = (
+    "Decide if the given answer is correct. Respond with True or False only.\n"
+    "Question: {}\n"
+    "Proposed Answer: {}\n"
+    "Solution: {}\n"
+    "Correctness: {}"
+)
 
-def format_prompt_with_eos(example):
-    text = training_prompt.format(
-        example['question'],
-        example['answer'],
-        example['solution'],
-        str(example['is_correct'])
-    ) + EOS_TOKEN
-    return {"text": text}
+def format_prompt(example):
+    return {
+        "text": training_prompt.format(
+            example["question"],
+            example["answer"],
+            example["solution"],
+            example["is_correct"]
+        ) + EOS
+    }
 
-dataset = dataset.map(format_prompt_with_eos)
+train_dataset = train_dataset.map(format_prompt)
+validation_dataset = validation_dataset.map(format_prompt)
 
 # -----------------------------
-# Training Arguments
+# Custom validation metric
+# -----------------------------
+### ADDED: parsing fn
+def parse_output(text):
+    text = text.lower()
+    if "true" in text: return True
+    if "false" in text: return False
+    return False  
+
+### ADDED: validation callback
+class ValCallback(TrainerCallback):
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        correct = 0
+        total = len(validation_dataset)
+
+        for ex in validation_dataset.select(range(500)):  # first 500 only
+            prompt = ex["text"].rsplit("Correctness:", 1)[0] + "Correctness:"
+            inp = tokenizer([prompt], return_tensors="pt").to("cuda")
+            out = model.generate(**inp, max_new_tokens=4)
+            text = tokenizer.decode(out[0], skip_special_tokens=True)
+            pred = parse_output(text)
+            true = (ex["is_correct"].lower() == "true")
+            correct += int(pred == true)
+
+        val_acc = correct / 500
+        wandb.log({"val_accuracy": val_acc})
+        print(f"\nValidation Accuracy (500 samples): {val_acc:.4f}\n")
+
+# -----------------------------
+# Training args
 # -----------------------------
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=BATCH_SIZE,
     gradient_accumulation_steps=GRAD_ACCUM,
     learning_rate=LEARNING_RATE,
-    optim = "adamw_8bit",
-    weight_decay = 0.01,
-    lr_scheduler_type = "linear",
+    optim="adamw_8bit",
+    weight_decay=0.01,
+    lr_scheduler_type="linear",
     num_train_epochs=EPOCHS,
     bf16=torch.cuda.is_available(),
     logging_steps=10,
-    save_strategy="steps",
     save_steps=200,
+    eval_steps=200,
     report_to="wandb",
     remove_unused_columns=False,
 )
 
-# -----------------------------
-# SFT Trainer
-# -----------------------------
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
-    train_dataset=dataset,
+    train_dataset=train_dataset,
+    eval_dataset=validation_dataset,
     dataset_text_field="text",
     max_seq_length=MAX_SEQ_LEN,
     args=training_args,
 )
+
+trainer.add_callback(ValCallback())  ### add callback
 
 trainer.train()
 trainer.save_model(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
 wandb.finish()
 print(f"Model saved to {OUTPUT_DIR}")
-
-
-# Load the official test set
-test_dataset = load_dataset("ad6398/nyu-dl-teach-maths-comp", split="test")
-
-
-# Instructional prompt template for test
-test_prompt_template = """Decide if the given answer is correct. Respond with True or False only. \nQuestion: {}\nProposed Answer: {}\nSolution:{}\nCorrectness:"""
-
-# A simple function to parse 'True' or 'False' from the model's raw output
-def parse_output(response_text):
-    output_part = response_text.split("Correctness:")[-1]
-    if 'true' in output_part.lower():
-        return True
-    elif 'false' in output_part.lower():
-        return False
-    else:
-        return True  # Default to True if unclear
-
-predictions = []
-
-# Loop through the test dataset and generate a prediction for each example
-for example in tqdm.tqdm(test_dataset):
-    question = example["question"]
-    answer = example["answer"]
-    solution = example["solution"]
-
-    # Format the prompt with EOS
-    prompt = test_prompt_template.format(question, answer, solution)
-
-    # Tokenize and move to GPU
-    inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-
-    # Generate output from the model (max 8 tokens to get True/False)
-    outputs = model.generate(**inputs, max_new_tokens=8, use_cache=True)
-    response_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
-
-    # Parse True/False prediction
-    prediction = parse_output(response_text)
-    predictions.append(prediction)
-
-# Create the submission DataFrame
-submission = pd.DataFrame({
-    "ID": range(len(test_dataset)),
-    "is_correct": predictions
-})
-
-# Save the CSV
-submission.to_csv("submission.csv", index=False)
-print("Submission file 'submission.csv' created successfully!")

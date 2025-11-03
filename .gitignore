@@ -1,4 +1,5 @@
 unsloth_compiled_cache
 math_verifier_model
+math_rank_verifier
 wandb
 *.csv
